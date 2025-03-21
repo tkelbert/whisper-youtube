@@ -1,90 +1,166 @@
 import os
+import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, simpledialog
-from glob import glob
-from subprocess import run
-import subprocess
-import shutil
+from tkinter import ttk, messagebox
+import yt_dlp
+import whisper
+import re
 
-WHISPER_AUDIO_DIR = os.path.expanduser("~/whisper_audio")
-os.makedirs(WHISPER_AUDIO_DIR, exist_ok=True)
+AUDIO_DIR = os.path.expanduser("~/whisper_audio")
 
-# Fallback downloaders
-DOWNLOADERS = ["yt-dlp", "youtube-dl", "you-get"]
 
-def download_audio(url):
-    for downloader in DOWNLOADERS:
-        if shutil.which(downloader):
-            try:
-                output_template = os.path.join(WHISPER_AUDIO_DIR, "%(title)s.%(ext)s")
-                cmd = [
-                    downloader,
-                    "-x",
-                    "--audio-format", "mp3",
-                    "-o", output_template,
-                    url
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    break
-            except Exception:
-                continue
-    else:
-        raise RuntimeError("No working downloader (yt-dlp, youtube-dl, you-get) found.")
+def sanitize_filename(name):
+    return re.sub(r'[\\/*?:"<>|]', "", name)
 
-    # Return newest mp3 file in the output directory
-    files = sorted(glob(os.path.join(WHISPER_AUDIO_DIR, "*.mp3")), key=os.path.getmtime, reverse=True)
-    return files[0] if files else None
 
-def transcribe_audio(filepath, model, task, language):
-    cmd = ["whisper", filepath, "--model", model, "--task", task, "--fp16", "False"]
+def download_audio(url, output_dir=AUDIO_DIR):
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+        }],
+        'quiet': True,
+        'noplaylist': True
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        title = info.get('title', 'audio')
+        filename = sanitize_filename(title) + ".mp3"
+        return os.path.join(output_dir, filename)
+
+
+def remove_timestamps(text):
+    return re.sub(r'\[\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}\.\d{3}\]\s+', '', text)
+
+
+def transcribe_audio(model_name, language, audio_path, translate, translate_to, remove_ts, dual_output):
+    model = whisper.load_model(model_name)
+    options = {
+        "fp16": False
+    }
     if language:
-        cmd += ["--language", language]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout + "\n" + result.stderr
+        options["language"] = language
 
-def run_pipeline():
-    url = simpledialog.askstring("YouTube URL", "Enter the YouTube video URL:")
-    if not url:
-        return
+    result = model.transcribe(audio_path, **options)
+    original_text = result['text']
 
-    try:
-        log_output("🎬 Downloading audio...")
-        audio_path = download_audio(url)
-        log_output(f"✔️ Audio downloaded: {os.path.basename(audio_path)}")
-    except Exception as e:
-        log_output(f"❌ Failed to download audio:\n{e}")
-        return
+    if remove_ts:
+        segments = result['segments']
+        original_text = '\n'.join([s['text'].strip() for s in segments])
 
-    model = simpledialog.askstring("Model", "Enter Whisper model (tiny, base, small, medium, large):", initialvalue="tiny") or "tiny"
-    task = simpledialog.askstring("Task", "Enter task (transcribe or translate):", initialvalue="transcribe") or "transcribe"
-    language = simpledialog.askstring("Language", "Enter language code (or leave blank to detect):", initialvalue="") or ""
+    if translate and language == "en" and translate_to:
+        translated_result = model.transcribe(audio_path, task="translate", language="en")
+        translated_text = translated_result['text']
+        if dual_output:
+            return f"English:\n{original_text}\n\n{translate_to.upper()}:\n{translated_text}"
+        return translated_text
 
-    log_output("🧠 Running Whisper transcription...")
-    try:
-        output = transcribe_audio(audio_path, model, task, language)
-        log_output("✅ Whisper completed.\n\n" + output)
-    except Exception as e:
-        log_output(f"❌ Whisper failed:\n{e}")
+    return original_text
 
-def log_output(text):
-    output_box.configure(state='normal')
-    output_box.insert(tk.END, text + "\n")
-    output_box.see(tk.END)
-    output_box.configure(state='disabled')
 
-# GUI setup
-root = tk.Tk()
-root.title("Whisper YouTube Transcriber")
+class WhisperApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("🎤 Whisper YouTube Transcriber")
+        self.geometry("800x700")
 
-frame = tk.Frame(root)
-frame.pack(padx=10, pady=10)
+        self.url_var = tk.StringVar()
+        self.model_var = tk.StringVar(value="tiny")
+        self.lang_var = tk.StringVar()
+        self.translate_var = tk.BooleanVar()
+        self.translate_to_var = tk.StringVar()
+        self.remove_ts_var = tk.BooleanVar()
+        self.dual_output_var = tk.BooleanVar()
 
-run_button = tk.Button(frame, text="Start Transcription", command=run_pipeline)
-run_button.pack()
+        self.create_widgets()
 
-output_box = scrolledtext.ScrolledText(root, width=100, height=30, wrap=tk.WORD, state='disabled')
-output_box.pack(padx=10, pady=10)
+    def create_widgets(self):
+        padding = {'padx': 10, 'pady': 5}
 
-root.mainloop()
+        tk.Label(self, text="YouTube URL:").pack(**padding)
+        tk.Entry(self, textvariable=self.url_var, width=90).pack(**padding)
 
+        frame = tk.Frame(self)
+        frame.pack(**padding)
+
+        tk.Label(frame, text="Model:").grid(row=0, column=0)
+        ttk.Combobox(frame, textvariable=self.model_var, values=["tiny", "base", "small", "medium", "large"], width=10).grid(row=0, column=1)
+
+        tk.Label(frame, text="Language (blank to detect):").grid(row=0, column=2)
+        tk.Entry(frame, textvariable=self.lang_var, width=10).grid(row=0, column=3)
+
+        tk.Checkbutton(self, text="Translate", variable=self.translate_var, command=self.toggle_translate).pack()
+
+        self.translate_frame = tk.Frame(self)
+        self.translate_to_label = tk.Label(self.translate_frame, text="Translate to:")
+        self.translate_to_entry = tk.Entry(self.translate_frame, textvariable=self.translate_to_var, width=10)
+        self.translate_to_label.pack(side=tk.LEFT)
+        self.translate_to_entry.pack(side=tk.LEFT)
+
+        tk.Checkbutton(self, text="Dual Output", variable=self.dual_output_var).pack()
+        tk.Checkbutton(self, text="Remove Timestamps", variable=self.remove_ts_var).pack()
+
+        self.translate_frame.pack()
+        self.translate_frame.forget()
+
+        tk.Button(self, text="Run", command=self.run_process).pack(pady=10)
+
+        self.status = tk.Label(self, text="Status: Idle", anchor="w")
+        self.status.pack(fill="x", padx=10, pady=5)
+
+        self.output = tk.Text(self, wrap="word")
+        self.output.pack(fill="both", expand=True, padx=10, pady=5)
+
+    def toggle_translate(self):
+        if self.translate_var.get():
+            self.translate_frame.pack()
+        else:
+            self.translate_frame.forget()
+
+    def run_process(self):
+        threading.Thread(target=self._run).start()
+
+    def set_status(self, message):
+        self.status.config(text=f"Status: {message}")
+        self.update()
+
+    def _run(self):
+        url = self.url_var.get().strip()
+        model = self.model_var.get().strip() or "tiny"
+        lang = self.lang_var.get().strip() or None
+        translate = self.translate_var.get()
+        translate_to = self.translate_to_var.get().strip()
+        remove_ts = self.remove_ts_var.get()
+        dual_output = self.dual_output_var.get()
+
+        if not url:
+            messagebox.showerror("Error", "You must enter a YouTube URL.")
+            return
+
+        self.set_status("Downloading audio...")
+        try:
+            if not os.path.exists(AUDIO_DIR):
+                os.makedirs(AUDIO_DIR)
+            audio_path = download_audio(url)
+        except Exception as e:
+            self.set_status("Download failed.")
+            messagebox.showerror("Download Error", str(e))
+            return
+
+        self.set_status("Transcribing audio...")
+        try:
+            text = transcribe_audio(model, lang, audio_path, translate, translate_to, remove_ts, dual_output)
+            self.output.delete("1.0", tk.END)
+            self.output.insert(tk.END, text)
+            self.set_status("Done.")
+        except Exception as e:
+            self.set_status("Error during transcription")
+            messagebox.showerror("Transcription Error", str(e))
+
+
+if __name__ == "__main__":
+    app = WhisperApp()
+    app.mainloop()
