@@ -1,95 +1,90 @@
 import os
-import subprocess
 import tkinter as tk
-from tkinter import messagebox
-from threading import Thread
-import whisper
+from tkinter import messagebox, scrolledtext, simpledialog
+from glob import glob
+from subprocess import run
+import subprocess
+import shutil
 
-def update_status(msg):
-    status_text.set(msg)
-    root.update()
+WHISPER_AUDIO_DIR = os.path.expanduser("~/whisper_audio")
+os.makedirs(WHISPER_AUDIO_DIR, exist_ok=True)
 
-def download_video(url, output_dir):
-    tools = ["yt-dlp", "youtube-dl"]
-    for tool in tools:
-        try:
-            update_status(f"Trying {tool}...")
-            filename_template = os.path.join(output_dir, "%(title)s.%(ext)s")
-            command = [tool, "-x", "--audio-format", "mp3", "-o", filename_template, url]
-            subprocess.run(command, check=True)
-            files = [f for f in os.listdir(output_dir) if f.endswith(".mp3")]
-            if files:
-                return os.path.join(output_dir, files[-1])
-        except Exception:
-            continue
-    raise Exception("All downloaders failed.")
+# Fallback downloaders
+DOWNLOADERS = ["yt-dlp", "youtube-dl", "you-get"]
 
-def transcribe_audio(file_path, model_size, task, translate_to):
-    update_status(f"Loading Whisper model '{model_size}'...")
-    model = whisper.load_model(model_size)
+def download_audio(url):
+    for downloader in DOWNLOADERS:
+        if shutil.which(downloader):
+            try:
+                output_template = os.path.join(WHISPER_AUDIO_DIR, "%(title)s.%(ext)s")
+                cmd = [
+                    downloader,
+                    "-x",
+                    "--audio-format", "mp3",
+                    "-o", output_template,
+                    url
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    break
+            except Exception:
+                continue
+    else:
+        raise RuntimeError("No working downloader (yt-dlp, youtube-dl, you-get) found.")
 
-    args = {"fp16": False, "task": task}
-    if task == "translate" and translate_to:
-        args["language"] = "en"
+    # Return newest mp3 file in the output directory
+    files = sorted(glob(os.path.join(WHISPER_AUDIO_DIR, "*.mp3")), key=os.path.getmtime, reverse=True)
+    return files[0] if files else None
 
-    update_status("Transcribing...")
-    result = model.transcribe(file_path, **args)
+def transcribe_audio(filepath, model, task, language):
+    cmd = ["whisper", filepath, "--model", model, "--task", task, "--fp16", "False"]
+    if language:
+        cmd += ["--language", language]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout + "\n" + result.stderr
 
-    output_path = file_path + ".txt"
-    with open(output_path, "w") as f:
-        f.write(result["text"])
-
-    update_status(f"Saved to {output_path}")
-    messagebox.showinfo("Done", f"Transcription saved to:\n{output_path}")
-
-def start_process():
-    url = url_entry.get()
+def run_pipeline():
+    url = simpledialog.askstring("YouTube URL", "Enter the YouTube video URL:")
     if not url:
-        messagebox.showerror("Error", "You must enter a YouTube URL.")
         return
 
-    model_size = model_entry.get() or "tiny"
-    task = task_var.get()
-    translate_to = translate_to_entry.get() if task == "translate" else None
+    try:
+        log_output("🎬 Downloading audio...")
+        audio_path = download_audio(url)
+        log_output(f"✔️ Audio downloaded: {os.path.basename(audio_path)}")
+    except Exception as e:
+        log_output(f"❌ Failed to download audio:\n{e}")
+        return
 
-    def thread_target():
-        try:
-            file_path = download_video(url, output_dir)
-            update_status(f"Downloaded to {file_path}")
-            transcribe_audio(file_path, model_size, task, translate_to)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+    model = simpledialog.askstring("Model", "Enter Whisper model (tiny, base, small, medium, large):", initialvalue="tiny") or "tiny"
+    task = simpledialog.askstring("Task", "Enter task (transcribe or translate):", initialvalue="transcribe") or "transcribe"
+    language = simpledialog.askstring("Language", "Enter language code (or leave blank to detect):", initialvalue="") or ""
 
-    Thread(target=thread_target).start()
+    log_output("🧠 Running Whisper transcription...")
+    try:
+        output = transcribe_audio(audio_path, model, task, language)
+        log_output("✅ Whisper completed.\n\n" + output)
+    except Exception as e:
+        log_output(f"❌ Whisper failed:\n{e}")
 
-# GUI Setup
+def log_output(text):
+    output_box.configure(state='normal')
+    output_box.insert(tk.END, text + "\n")
+    output_box.see(tk.END)
+    output_box.configure(state='disabled')
+
+# GUI setup
 root = tk.Tk()
 root.title("Whisper YouTube Transcriber")
 
-output_dir = os.path.expanduser("~/whisper_audio")
-os.makedirs(output_dir, exist_ok=True)
+frame = tk.Frame(root)
+frame.pack(padx=10, pady=10)
 
-tk.Label(root, text="YouTube URL:").pack()
-url_entry = tk.Entry(root, width=60)
-url_entry.pack()
+run_button = tk.Button(frame, text="Start Transcription", command=run_pipeline)
+run_button.pack()
 
-tk.Label(root, text="Whisper model (default: tiny):").pack()
-model_entry = tk.Entry(root, width=20)
-model_entry.pack()
-
-tk.Label(root, text="Task:").pack()
-task_var = tk.StringVar(value="transcribe")
-tk.Radiobutton(root, text="Transcribe", variable=task_var, value="transcribe").pack(anchor="w")
-tk.Radiobutton(root, text="Translate", variable=task_var, value="translate").pack(anchor="w")
-
-tk.Label(root, text="Translate to (if translating):").pack()
-translate_to_entry = tk.Entry(root, width=10)
-translate_to_entry.pack()
-
-tk.Button(root, text="Start", command=start_process).pack(pady=10)
-
-status_text = tk.StringVar()
-tk.Label(root, textvariable=status_text, fg="blue").pack()
+output_box = scrolledtext.ScrolledText(root, width=100, height=30, wrap=tk.WORD, state='disabled')
+output_box.pack(padx=10, pady=10)
 
 root.mainloop()
 
